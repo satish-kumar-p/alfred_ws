@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+import rclpy
+from rclpy.node import Node
+from rclpy.parameter import Parameter
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy, HistoryPolicy
+from std_msgs.msg import Float32, String, Int32, Empty
+import json
+import os
+import time
+import threading
+import random
+
+TABLE_DATA_FILE = "table_locations.json"
+
+class SimulationManagerNode(Node):
+    def __init__(self):
+        super().__init__('simulation_manager')
+
+        # ---------------- State Variables ----------------
+        self.battery_level      = 100.0
+        self.current_mode       = "Training"
+        self.table_locations    = {}  # persisted to JSON
+        # Boot status is stored as a dict and never re‐computed
+        self.last_boot_status   = {"checks": [], "overall_status": "NOT READY", "message": ""}
+        # Acknowledgement variables
+        self.reset_base_ack     = ""
+        self.add_table_ack      = ""
+        self.return_base_ack    = ""
+        # Delivery status variable
+        self.delivery_status    = ""
+
+        # ---------------- QoS for latched publishers ----------------
+        latched_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL
+        )
+
+        # ---------------- Publishers ----------------
+        self.battery_pub          = self.create_publisher(Float32, '/battery_status',    10)
+        self.boot_pub             = self.create_publisher(String,   '/boot_check',        latched_qos)
+        self.mode_pub             = self.create_publisher(String,   '/set_mode',      latched_qos)
+        self.table_list_pub       = self.create_publisher(String,   '/table_list',        latched_qos)
+        self.reset_base_ack_pub   = self.create_publisher(String,   '/reset_base_loc_ack', latched_qos)
+        self.add_table_ack_pub    = self.create_publisher(String,   '/add_table_ack',      latched_qos)
+        self.return_base_ack_pub  = self.create_publisher(String,   '/return_base_ack',    latched_qos)
+        # —— New delivery_status topic ——
+        self.delivery_status_pub  = self.create_publisher(String,   '/delivery_status',    latched_qos)
+
+        # ---------------- Timers ----------------
+        self.create_timer(1.0, self._battery_timer_callback)
+        self.create_timer(1.0, self._publish_mode_callback)
+        # Continuous boot_check republish
+        self.create_timer(5.0, self._publish_last_boot_status)
+        # Continuous ACK publishes
+        self.create_timer(1.0, self._publish_reset_base_ack)
+        self.create_timer(1.0, self._publish_add_table_ack)
+        self.create_timer(1.0, self._publish_return_base_ack)
+        # —— Continuous delivery_status publish ——
+        # self.create_timer(1.0, self._publish_delivery_status)
+
+        # ---------------- Declare override parameters ----------------
+        for comp in ("lidar","camera","imu","motors"):
+            self.declare_parameter(f"boot_check_override_{comp}", "")
+
+        # ---------------- Subscribers ----------------
+        self.create_subscription(String, '/set_parameter',  self._set_parameter_callback, 10)
+        self.create_subscription(String, '/set_mode',       self._set_mode_callback,      10)
+        self.create_subscription(String,  '/save_point',      self._add_table_callback,     10)
+        self.create_subscription(String,  '/goto_point',  self._move_to_table_callback, 10)
+        self.create_subscription(String,  '/reset_base_loc', self._reset_base_loc_callback,10)
+        self.create_subscription(String,  '/return_base',    self._return_base_callback,   10)
+        self.create_subscription(Empty,  '/get_table_list', self._get_table_list_callback,10)
+
+        # ---------------- Initial Actions ----------------
+        self.mode_pub.publish(String(data=self.current_mode))
+        self._load_table_data()
+        self.get_logger().info("SimulationManagerNode initialized.")
+
+    # —— Timers Callbacks ——————————————————————————————————————
+
+    def _battery_timer_callback(self):
+        self.battery_level = (self.battery_level - 0.05) % 100.0
+        self.battery_pub.publish(Float32(data=round(self.battery_level,2)))
+
+    def _publish_mode_callback(self):
+        self.mode_pub.publish(String(data=self.current_mode))
+
+    def _publish_last_boot_status(self):
+        self.boot_pub.publish(String(data=json.dumps(self.last_boot_status)))
+
+    def _publish_reset_base_ack(self):
+        self.reset_base_ack_pub.publish(String(data=self.reset_base_ack))
+
+    def _publish_add_table_ack(self):
+        self.add_table_ack_pub.publish(String(data=self.add_table_ack))
+
+    def _publish_return_base_ack(self):
+        self.return_base_ack_pub.publish(String(data=self.return_base_ack))
+
+    def _publish_delivery_status(self):
+        # Always publish even if empty
+        self.delivery_status_pub.publish(String(data=self.delivery_status))
+
+    # —— Parameter Update ——————————————————————————————————————
+
+    def _set_parameter_callback(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+            name = data.get("param")
+            val  = data.get("value")
+            if not name:
+                raise ValueError("missing 'param'")
+            # special params
+            if name == "reset_base_ack":
+                self.reset_base_ack = str(val)
+            elif name == "add_table_ack":
+                self.add_table_ack = str(val)
+            elif name == "return_base_ack":
+                self.return_base_ack = str(val)
+            elif name == "last_boot_status":
+                # expect a JSON‐serializable dict/string
+                self.last_boot_status = json.loads(val) if isinstance(val,str) else val
+            elif name == "delivery_status":
+                self.delivery_status = str(val)
+                self.delivery_status_pub.publish(String(data=self.delivery_status))  # publish only once here
+            elif name == "ops_mode":
+                self.current_mode = str(val)
+            else:
+                # generic ROS parameter
+                self.set_parameters([Parameter(name, Parameter.Type.STRING, val)])
+            self.get_logger().info(f"Parameter '{name}' set to '{val}'")
+        except Exception as e:
+            self.get_logger().error(f"Parameter update failed: {e}")
+
+    # —— Operation Mode ——————————————————————————————————————
+
+    def _set_mode_callback(self, msg: String):
+        self.current_mode = msg.data.strip()
+
+    # —— Table Management ——————————————————————————————————————
+
+    def _add_table_callback(self, msg: String):
+        tid = msg.data.strip()
+        # Store current pose (if you still have pose logic)
+        self.table_locations[tid] = {
+            "x": getattr(self, "current_x", 0.0),
+            "y": getattr(self, "current_y", 0.0),
+            "yaw": getattr(self, "current_yaw", 0.0),
+        }
+        self.add_table_ack = f"Stored table {tid}"
+        self._save_table_data()
+
+    def _get_table_list_callback(self, msg: Empty):
+        self._publish_table_list()
+
+    def _publish_table_list(self):
+        # Only the list of IDs now
+        ids = list(self.table_locations.keys())
+        self.table_list_pub.publish(String(data=json.dumps(ids)))
+
+    def _save_table_data(self):
+        try:
+            with open(TABLE_DATA_FILE, 'w') as f:
+                json.dump(self.table_locations, f)
+        except Exception as e:
+            self.get_logger().error(f"Failed saving tables: {e}")
+
+    def _load_table_data(self):
+        if os.path.exists(TABLE_DATA_FILE):
+            try:
+                with open(TABLE_DATA_FILE, 'r') as f:
+                    self.table_locations = json.load(f)
+            except Exception as e:
+                self.get_logger().error(f"Failed loading tables: {e}")
+
+    # —— Delivery Logic ——————————————————————————————————————
+
+    def _move_to_table_callback(self, msg: String):
+        tid = msg.data.strip()
+        if tid not in self.table_locations:
+            self.get_logger().warn(f"Table {tid} not found")
+            return
+
+    # —— Reset & Return Base —————————————————————————————————————
+
+    def _reset_base_loc_callback(self, msg: String):
+        # You’d reset your pose here if you had one
+        self.reset_base_ack = "Base reset"
+
+    def _return_base_callback(self, msg: String):
+        self.return_base_ack = "Returning to base"
+        # threading.Thread(target=lambda: (time.sleep(1.0), setattr(self, "return_base_ack", "At base")), daemon=True).start()
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = SimulationManagerNode()
+    try:
+        rclpy.spin(node)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()

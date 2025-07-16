@@ -1,1 +1,0 @@
-# This launch file is triggered when an area is mapped and wants to be saved into storage. 
